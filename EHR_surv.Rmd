@@ -1,0 +1,765 @@
+---
+title: "491923_EHR"
+author: "491923_EHR"
+date: "2024-03-21"
+output: html_document
+---
+
+#### Proton pump inhibitor(PPI) VS Histamine H2-receptor antagonist(H2RA); all cause mortality
+
+#### Install and load the required libraries
+
+```{r}
+# install commands have been commented out, install only if packages are missing. Libraries can be loaded if missing too.
+#install.packages("tidyverse")
+#install.packages("survival")
+#install.packages("table1")
+#install.packages("survminer")
+#install.packages("knitr")
+#install.packages("kableExtra")
+#install.packages("broom")
+
+#load required libraries if missing
+library(tidyverse)
+library(survival)
+library(table1)
+library(survminer)
+library(consort)
+library(knitr)
+library(kableExtra)
+library(broom)
+
+```
+
+### 1. Load data and codelists into two complied list objects
+
+```{r}
+# Lists files directory matching the specified pattern, subset string to lowercase and remove unneeded characters
+
+files <- list.files("Assessment_sample", full.names = TRUE, pattern = ".csv")
+filenames <- str_to_lower(str_remove(str_remove(tools::file_path_sans_ext(basename(files)), "_assessment_24"), "Sim_"))
+
+# Apply the read_csv function to all files and save the output as one big list
+data <- lapply(files, readr::read_csv)
+names(data) <- filenames
+sapply(data, function(x) sapply(x, class))
+# Change some varaiables to factor/categorical
+# Specify which columns should be factors
+factor_vars <- c("gender", "eth5", "constype", "imd_person")
+# For all datasets, across any of the above specified columns, convert to factors
+data <- map(data, ~.x %>% mutate(across(any_of(factor_vars), as_factor)))
+
+
+## For the codelist
+# Make a list of all file paths and file names
+files <- list.files("Codelists", full.names = TRUE, pattern = "codes.csv")
+filenames <- str_to_lower(str_remove(tools::file_path_sans_ext(basename(files)), "_codes"))
+
+# Apply the read_csv function to all files and save the output as one big list
+codes <- lapply(files, readr::read_csv)
+names(codes) <- filenames
+```
+
+#### Initial exploratory analysis
+
+```{r}
+#Reorder deprivation status
+levels(data$imd$imd_person)
+data$imd$imd_person <- factor(data$imd$imd_person, levels = c("Least Deprived (1)", "2", "3", "4", "Most Deprived (5)"))
+levels(data$imd$imd_person)
+
+#Chech total number of unique patients
+data$patient %>%
+  summary()
+data$patient %>%
+  summarise(n_rows = n(),
+            n_patients = n_distinct(patid))
+
+```
+
+#### Combine PPI and H2RA prescriptions and create cohort based on 1st prescription
+
+```{r}
+#Inspect ppi and h2ra codelists
+data$therapy %>% 
+  summary()
+head(codes$ppi)
+head(codes$h2ra)
+
+# Extract all PPI prescriptions, join with therapy dataset on prodcode
+ppis <- data$therapy %>% 
+  inner_join(codes$ppi, by="prodcode") %>%
+  mutate(ppi=1)
+
+# Extract all H2RA prescriptions, join with therapy dataset on prodcode
+h2ras<- data$therapy %>% 
+  inner_join(codes$h2ra, by="prodcode") %>%
+  mutate(ppi=0)
+
+# Combine PPI and H2RA prescriptions into one dataframe
+ppis_h2ras<-rbind(ppis, h2ras)
+
+cohort <- ppis_h2ras %>%  # Take the list of PPI/H2RA prescriptions
+  arrange(patid, eventdate) %>% # Sort by patient, then by prescription date
+  filter(!duplicated(patid)) # Take the top row per patient (i.e. earliest prescription date)
+nrow(cohort)
+```
+
+#### Create cohort and implement two of the eligibility criteria
+
+-   After the date of the patient's registration at the general practice plus one year
+
+-   Between 17 April 1997 and 17 April 2017
+
+```{r}
+# Take the cohort dataset and join the "Patient" dataset
+# keep only observations where the eventdate is later than the registration date + 1 year
+
+#Criteria 2
+cohort <- cohort %>% 
+  left_join(data$patient[c("patid", "crd")], by="patid") %>% 
+  filter(eventdate > crd+365.25)
+nrow(cohort)
+
+#Criteria 3
+# Filter cohort to contain observations 17 April 1997 and 17 April 2017
+cohort <- cohort %>% 
+  filter(eventdate >= as.Date("1997-04-17") & eventdate <= as.Date("2017-04-17"))
+nrow(cohort)
+
+# Create flowchart dataset with one row per patient, with a variable indicating reason for exclusion
+flowchart <- ppis_h2ras %>%   
+  arrange(patid, eventdate) %>%  
+  filter(!duplicated(patid))  %>% 
+  left_join(data$patient[c("patid", "crd", "eth5")], by="patid") %>%  
+  mutate(excluded = case_when((eventdate < crd+365.25) ~ "Insufficient registration", 
+                              (eventdate < as.Date("1997-04-17") | eventdate > as.Date("2017-04-17")) ~ "Prescription out of dates",
+                              eth5 == "Unknown" ~ "Unrecorded ethnicity"
+                              )) %>%
+  mutate(ppi_str = case_when(ppi==1 ~ "PPI", ppi==0 ~ "H2RA")) 
+
+# Create flowchart
+flow <- consort_plot(data = flowchart,
+                     orders = c(patid =    "Patients with PPI/H2RA prescription",
+                                excluded = "Excluded",
+                                ppi_str =  "Received eligible prescription",
+                                patid =    "Analysed"),
+                     side_box = c("excluded"),
+                     allocation = "ppi_str")
+
+# Display flowchart
+plot(flow)
+
+#change index date name
+cohort <- cohort %>% 
+  select(patid, eventdate, ppi) %>% 
+  rename(indexdate=eventdate)
+cohort
+```
+
+#### Extract data for patients with prior history of gastric cancer
+
+```{r}
+#Gastric cancer data
+prior_gastric_cancer <- data$clinical %>% 
+  inner_join(codes$gastric_cancer, by="medcode") %>% 
+  arrange(patid, eventdate) %>% 
+  filter(!duplicated(patid)) %>% 
+  inner_join(cohort, by="patid") %>% 
+  filter(eventdate < indexdate) %>% 
+  mutate(prior_gastric_cancer=1) %>% 
+  select(patid, prior_gastric_cancer)
+prior_gastric_cancer
+```
+
+#### Extract data for patients with GERD last 6 months prior to prescription
+
+```{r}
+#Gerd data
+recent_gerd <- data$clinical %>% 
+  inner_join(cohort, by="patid") %>% 
+  arrange(patid, eventdate) %>% 
+  inner_join(codes$gerd, by="medcode") %>% 
+  filter(eventdate>=indexdate-180 & eventdate<=indexdate) %>% 
+  filter(!duplicated(patid)) %>% 
+  select(patid) %>% 
+  mutate(recent_gerd=1) 
+recent_gerd
+```
+
+#### Extract data for patients with peptic ulcer 6 months prior to prescription
+
+```{r}
+#Peptic ulcer data
+recent_pepticulcer <- data$clinical %>% 
+  inner_join(cohort, by="patid") %>% 
+  arrange(patid, eventdate) %>% 
+  inner_join(codes$peptic_ulcer, by="medcode") %>% 
+  filter(eventdate>=indexdate-180 & eventdate<=indexdate) %>% 
+  filter(!duplicated(patid)) %>% 
+  select(patid) %>% 
+  mutate(recent_pepticulcer=1) 
+recent_gerd
+
+```
+
+#### Extract data for patients with specific consultations
+
+```{r}
+#Consultation data for specific consultations
+filtered_consultations <- data$consultations %>%
+  filter(constype %in% c("Surgery consultation", "Follow-up/routine visit", "Clinic", "Telephone call from a patient", "Acute visit", "Home Visit", "Emergency Consultation"))%>%
+  inner_join(cohort, by="patid") %>% 
+  arrange(patid, eventdate) %>% 
+  filter(eventdate>=indexdate-365.25 & eventdate<=indexdate) %>% 
+  group_by(patid) %>%
+  summarize(total_consultations = n())
+```
+
+#### Create study end dates for observations
+
+```{r}
+# Join cohort with patient data to create enddate by patient id and specific requirements; minimum of the study end date or tod or deathdate
+enddates <- cohort %>% 
+  left_join(data$patient, by="patid") %>% 
+  mutate(enddate=pmin( 
+    as.Date("2017-04-17"), 
+    pmin(tod, deathdate, na.rm = TRUE),
+    na.rm = TRUE),
+    died=ifelse(is.na(deathdate), 0, (deathdate==enddate))) %>% 
+  select(patid, deathdate, enddate, died)
+enddates
+```
+
+#### Demographics datasframe
+
+Data frame with cohort and selected specific demographic characteristics, age at first prescription and also a stratified calendar period
+
+```{r}
+# Dataset with deprivation status
+demographics <- cohort %>% 
+  left_join(data$patient, by="patid") %>%
+  left_join(data$imd, by="patid") %>% 
+  mutate(age=round(as.numeric(indexdate-as.Date(paste0(yob, "-06-15")))/365.25),
+         calendarperiod=case_when(indexdate<as.Date("2000-01-01") ~ "1997-1999",
+                                  indexdate<as.Date("2005-01-01") ~ "2000-2004",
+                                  indexdate<as.Date("2010-01-01") ~ "2005-2009",
+                                  indexdate<as.Date("2015-01-01") ~ "2010-2014",
+                                  indexdate>=as.Date("2015-01-01") ~ "2015-2017")) %>% 
+  rename(pracid=pracid.x) %>%
+  select(patid, pracid, age, gender, imd_person,eth5, calendarperiod)
+demographics
+```
+
+#### Extract BMI data: calculate BMI from raw BMI and also Weight and Height
+
+```{r}
+bmi_data <- data$clinical %>% 
+  filter(enttype==13) %>% # Keep weight/BMI measurements only
+  rename(bmi_date=eventdate) %>%
+  inner_join(cohort, by="patid") %>%
+  inner_join(data$additional, by= c("patid", "enttype", "adid"))  %>% 
+  rename(bmi=data3) %>% # Pick out BMI measurements
+  filter(as.numeric(indexdate - bmi_date) >= 0 & as.numeric(indexdate - bmi_date) <= 5 * 365.25) %>% # Keep measurements within 5 years
+  filter(!is.na(bmi), between(bmi, 5, 200)) %>% # Delete extreme measurements
+  group_by(patid, bmi_date) %>%
+  summarize(bmi = mean(bmi)) %>% # Average measurements on same day
+  arrange(patid, bmi_date) %>% 
+  ungroup() %>%
+  group_by(patid)  %>%
+  filter(bmi_date == max(bmi_date)) %>% # Keep one measurement (the latest)
+  mutate(preference=2) %>% # Mark as less preferred (vs calculated from weight)
+  select(patid, bmi, bmi_date, preference) 
+
+# Check that there is one row per patient in the BMI data
+length(unique(bmi_data$patid))==nrow(bmi_data)
+weight_data <- data$clinical %>% 
+  filter(enttype ==13) %>%  # Keep weight/BMI measurements only
+  rename(weight_date=eventdate) %>%
+  inner_join(cohort, by="patid") %>%
+  inner_join(data$additional, by= c("patid", "enttype", "adid"))  %>% 
+  rename(weight_kg=data1) %>% # Pick out weight measurements
+  filter(as.numeric(indexdate - weight_date) >= 0 & as.numeric(indexdate - weight_date) <= 5 * 365.25)%>% # Keep measurements within 5 years
+  filter(!is.na(weight_kg), weight_kg>=20)  %>%  # Delete extreme measurements
+  group_by(patid, weight_date)  %>%
+  summarize(weight_kg = mean(weight_kg)) %>% # Average measurements on same day
+  arrange(patid, weight_date) %>% 
+  ungroup() %>%
+  group_by(patid)  %>%
+  filter(weight_date == max(weight_date)) %>% # Keep one measurement (the latest)
+  select(patid, weight_kg, weight_date)
+
+# Check that there is one row per patient in the weight data
+length(unique(weight_data$patid))==nrow(weight_data)
+
+# Height measurements
+height_data <- data$clinical %>% 
+  filter(enttype ==14)  %>% # Keep height measurements only
+  rename(height_date=eventdate) %>%
+  inner_join(cohort, by="patid") %>%
+  inner_join(data$additional, by= c("patid", "enttype", "adid")) %>%
+  rename(height_m=data1) %>%
+  mutate(yoh = as.numeric(format(height_date, "%Y")))  %>%
+  filter(!is.na(height_m), between(height_m, 1.20, 2.15)) %>% # Remove extreme measurements
+  group_by(patid, height_date) %>%
+  summarize(height_m = mean(height_m))  %>% # Average measurements on same day
+  arrange(patid, height_date) %>% 
+  ungroup() %>%
+  group_by(patid)  %>%
+  filter(height_date == max(height_date)) %>% # Keep one measurement (the latest)
+  select(patid, height_m, height_date)  
+
+# Check that there is one row per patient in the height data
+length(unique(height_data$patid))==nrow(height_data)
+
+# Calculate BMI from weight and height
+bmi_calculate <- inner_join(height_data, weight_data, by="patid")  %>%
+  mutate(bmi=weight_kg/height_m^2, preference=1) %>% 
+  rename(bmi_date=weight_date) %>% # Set date of calculation to date of weight
+  select(patid, bmi, bmi_date, preference) 
+
+bmi <- rbind(bmi_calculate, bmi_data)
+bmi <- bmi %>%
+  arrange(patid, preference) %>% # Put the calculated BMI first (per patient)
+  filter(!duplicated(patid)) %>% # Take only the first row per patient 
+  select(patid, bmi)
+
+# Check that there is one row per patient in the final BMI data
+length(unique(bmi$patid))==nrow(bmi)
+```
+
+#### Extract analysis dataset
+
+```{r}
+#Join different extracted data by common patient id
+analysis_dataset <- cohort %>% 
+  left_join(prior_gastric_cancer, by="patid") %>% 
+  left_join(recent_gerd, by="patid") %>% 
+  left_join(recent_pepticulcer, by="patid") %>% 
+  left_join(enddates, by="patid") %>% 
+  left_join(demographics, by="patid") %>% 
+  left_join(bmi, by="patid") %>% 
+  left_join(filtered_consultations, by="patid") %>% 
+  mutate(across(.cols = c("prior_gastric_cancer", "recent_gerd", "recent_pepticulcer"),#add 0 to observations with no events
+                .fns = ~ ifelse(is.na(.x), 0, 1)))
+analysis_dataset
+
+```
+
+#### Create survival/follow up time
+
+Replace "0" observed follow up time with value less that minimum
+
+```{r}
+# Create survival time from enddate and indexdate
+analysis_dataset <- analysis_dataset %>%
+  mutate(survtime = as.numeric(difftime(enddate, indexdate, units = "days")))
+# Replace 0 with 0.9 and convert survtime to years
+analysis_dataset <- analysis_dataset %>%
+  mutate(survtime = ifelse(survtime == 0, 0.9, survtime / 365.25))
+
+```
+
+#### Remove unneeded variables, check levels of categorical variables and further eligibility checks
+
+Remove unknown in ethnicity to meet eligibility criteria
+
+Check for recoreded year of birth and gender
+
+```{r}
+
+levels(analysis_dataset$eth5)
+table(analysis_dataset$eth5)
+
+
+#clean and drop unused levels
+analysis_dataset <- analysis_dataset %>%
+  filter(eth5 != "Unknown")
+analysis_dataset$eth5 <- droplevels(analysis_dataset$eth5)
+# drop columns not needed for survival analysis for easier datahandling,(pracid, indexdate, deathdate, enddate)
+analysis_dataset <- analysis_dataset %>%
+  select(-pracid, -indexdate, -deathdate, -enddate)
+#Optionally save dataset
+#saveRDS(analysis_dataset, file = "analysis_dataset.Rds") 
+```
+
+### 2. Descriptive statistics and preliminary analysis
+
+```{r}
+# Range of survival time
+range(analysis_dataset$survtime)
+# Create plot object for easier manipulation
+plotdata <- analysis_dataset
+# manipulate variables for tabular presentation, assign labels for the levels
+plotdata$died <- 
+  factor(plotdata$died, levels=c(0,1),
+         labels=c("NO", 
+                  "YES"))
+plotdata$recent_gerd <- 
+  factor(plotdata$recent_gerd , levels=c(0,1),
+         labels=c("NO", 
+                  "YES"))
+plotdata$recent_pepticulcer <- 
+  factor(plotdata$recent_pepticulcer , levels=c(0,1),
+         labels=c("NO", 
+                  "YES"))
+plotdata$prior_gastric_cancer <- 
+  factor(plotdata$prior_gastric_cancer  , levels=c(0,1),
+         labels=c("NO", 
+                  "YES"))
+plotdata$ppi <- 
+ factor(plotdata$ppi  , levels=c(0,1),
+         labels=c("H2RA", 
+                  "PPI"))
+#Change labels for interpretability
+label(plotdata$age)       <- "AGE"
+label(plotdata$died)        <- "DIED"
+label(plotdata$eth5)      <- "ETHNICITY"
+label(plotdata$gender) <- "GENDER"
+label(plotdata$bmi) <- "BMI"
+label(plotdata$prior_gastric_cancer) <- "PRIOR GASTRIC CANCER"
+label(plotdata$imd_person) <- "DEPRIVATION STATUS"
+label(plotdata$recent_pepticulcer) <- "RECENT PEPTIC ULCER"
+label(plotdata$recent_gerd) <- "RECENT GERD"
+label(plotdata$total_consultations) <- "TOTAL CONSULTATIONS"
+label(plotdata$survtime) <- "SURVIVAL TIME"
+label(plotdata$calendarperiod) <- "CALENDAR PERIOD"
+#Asiign usnits gor age, BMI and survival time
+units(plotdata$age)       <- "years"
+units(plotdata$bmi) <- "kg/m2"
+units(plotdata$survtime) <- "years"
+#set mathematical parameters and rounding arguments
+caption  <- "Basic stats"
+my.render.cont <- function(x) {
+  with(stats.apply.rounding(stats.default(x), digits=2), c("",
+                                                           "Mean (SD)"=sprintf("%s (&plusmn; %s)", MEAN, SD)))
+}
+#plot table
+mytable <- table1(~ age+eth5+died+gender+ bmi+ imd_person+prior_gastric_cancer+recent_gerd+recent_pepticulcer+ total_consultations+survtime+calendarperiod|ppi,render.continuous=my.render.cont, data=plotdata,topclass="Rtable1-zebra") 
+mytable
+```
+
+#### Kaplan-Meier plot to investigate the crude association between exposure status and survival, evidence for a difference between the two survival curves using log rank tests
+
+```{r}
+# Plot Kaplan-Meier curves with p-values, risk table, and confidence intervals
+km <- survfit(Surv(survtime,died)~factor(ppi),data=analysis_dataset)
+#Plot KM curve with risktable and logrank p value
+ggsurvplot(km, data = analysis_dataset, pval = TRUE, risk.table = "nrisk_cumevents", conf.int = TRUE, xlab="Time since first prescription(years)", legend.labs=c("H2RA","PPI"), title="KAPLAN MEIER PLOT OF EXPOSURE GROUPS(with pvalue)")
+
+# Perform log-rank test
+survdiff(Surv(survtime, died) ~ factor(ppi), data = analysis_dataset)
+```
+
+### 3. Analysis using Cox Regression
+
+#### Fit a univariable cox model
+
+```{r}
+#Fit univariate cox model
+univar_cox<-coxph(Surv(survtime,died)~as.factor(ppi),data=analysis_dataset)
+summary(univar_cox)
+```
+
+#### Cox multivariable and Martingale residual
+
+```{r}
+#Remove missing obseavations(missing BMI)
+analysis_dataset <- na.omit(analysis_dataset)
+#Cox multivariable model
+cox_multivariable <- coxph(Surv(survtime, died) ~ 
+                             factor(ppi) + 
+                             factor(recent_gerd) + 
+                             factor(recent_pepticulcer) + 
+                             factor(prior_gastric_cancer) + 
+                             factor(gender) + 
+                             bmi + 
+                             age + 
+                             factor(eth5) + 
+                             factor(imd_person) + 
+                             factor(calendarperiod) + 
+                             total_consultations,  
+                           data = analysis_dataset)
+
+summary(cox_multivariable)
+```
+
+#### Martingale residual tests for continuous variables for multivariable model(age and total consultation time
+
+This is done to consider method of imputation of continuous confounders. BMI already restricted to linear
+
+```{r}
+# Initiate residual object
+martingale_res <- resid(cox_multivariable, type = "martingale")
+
+#martingale residual plots for age
+y_min <- -1 #set limits for y axis for closer residual view
+y_max <- 1
+par(mfrow=c(1,2)) # initiate 2 by 1 plot area
+plot(analysis_dataset$age, martingale_res, xlab = "Age", ylab = "Martingale Residual", 
+     main = "Martingale Residuals vs. Age", ylim = c(y_min, y_max))
+lowess_line <- lowess(analysis_dataset$age, martingale_res, f = 0.5)  # Set smoother span to 0.5
+lines(lowess_line, col = "red", lwd = 2)
+abline(h=0,lwd=2,col="grey")
+
+
+# Martingale plot for total consultations
+y_min <- -1
+y_max <- 1
+plot(analysis_dataset$total_consultations, martingale_res, xlab = "Total Consultations", 
+     ylab = "Martingale Residual", main = "Martingale Residuals vs. Total Consultations")
+lines(lowess(analysis_dataset$total_consultations, martingale_res),col="red", lwd=2)
+
+
+```
+
+```         
+```
+
+#### Include age interaction term and repeat martingale plot
+
+```{r}
+cox_multivariable1 <- coxph(Surv(survtime, died) ~ 
+                             factor(ppi) + 
+                             factor(recent_gerd) + 
+                             factor(recent_pepticulcer) + 
+                             factor(prior_gastric_cancer) + 
+                             factor(gender) + 
+                             bmi + 
+                             age + 
+                             I(age^3)+
+                             factor(eth5) + 
+                             factor(imd_person) + 
+                             factor(calendarperiod) + 
+                             total_consultations,  
+                           data = analysis_dataset)
+
+```
+
+#### Refit Martingale residual and replot
+
+```{r}
+#Repeat martingale plot
+martingale_res2 <- resid(cox_multivariable1, type = "martingale")
+
+y_min <- -1
+y_max <- 1
+par(mfrow=c(1,1))
+plot(analysis_dataset$age, martingale_res2, xlab = "Age", ylab = "Martingale Residual", 
+     main = "Martingale Residuals vs. Age", ylim = c(y_min, y_max))
+lowess_line <- lowess(analysis_dataset$age, martingale_res2, f = 0.5)  # Set smoother span to 0.5
+lines(lowess_line, col = "red", lwd = 2)
+abline(h=0,lwd=2,col="grey")
+
+
+
+```
+
+#### Assessing proportional hazards assumption using schoenfeld residuals; statistical tests and plots
+
+```{r}
+#Initiate residual object on refitted multivariable model
+sch.resid<-cox.zph(cox_multivariable1, transform = 'identity')
+
+sch.resid
+
+
+```
+
+Plot Shoenfeld residuals
+
+```{r}
+#plot schoenfeld residuals
+plot(sch.resid,col="red",lwd=2)
+```
+
+Selected plot of shoenfeld residuals with p value\< 0.05
+
+#### Refit a multiivariable cox model with chosen confounders
+
+```{r}
+final_CoxModel <- coxph(Surv(survtime, died) ~ 
+                            factor(ppi) + 
+                            factor(recent_gerd) +
+                            factor(recent_pepticulcer) + 
+                            factor(prior_gastric_cancer) + 
+                            factor(gender) + 
+                            factor(eth5) + 
+                            factor(imd_person) +
+                            age +
+                            I(age^3),
+                          data = analysis_dataset)
+summary(final_CoxModel)
+```
+
+#### Create table object with broom package and knit with kable
+
+```{r}
+#Create table to see coefficients of final cox model
+coef_table <- broom::tidy( final_CoxModel, exponentiate=TRUE, conf.int=TRUE)
+kable(coef_table,caption = 'Coefficients of final cox model', longtable = F) %>%
+  kable_styling(font_size = 13) %>% row_spec(0, font_size=12)
+
+```
+
+#### Estimated survivor curves under the two exposure statuses for selected individuals
+
+```{r}
+par(mfrow=c(2,2))
+# Estimate survival curves for 50yo White male on ppi, no comorbidities
+survfit1 <- survfit(final_CoxModel, 
+                    newdata = data.frame(ppi = "1", 
+                                         age = 50,
+                                         gender = "Male",
+                                         recent_gerd = "0",
+                                         recent_pepticulcer ="0",
+                                         prior_gastric_cancer ="0",
+                                         eth5 = "White",
+                                         imd_person = "Most Deprived (5)"))
+
+# Estimate survival curves for 50yo White male on h2ra, no comorbidities
+survfit2 <- survfit(final_CoxModel, 
+                    newdata = data.frame(ppi = "0", 
+                                         age = 50,
+                                         gender = "Male",
+                                         recent_gerd = "0",
+                                         recent_pepticulcer ="0",
+                                         prior_gastric_cancer ="0",
+                                         eth5 = "White",
+                                         imd_person = "Most Deprived (5)"))
+
+# Plot survival curves
+plot(survfit1, col = "blue", lty = 1, xlim = c(0, 20), ylim = c(0, 1), xlab = "Time(years)", ylab = "Survival Probability", main = "50yo White Male,Most Deprived ")
+lines(survfit2, col = "red", lty = 1)
+legend("bottomleft", legend = c("PPI", "H2RA"), col = c("blue", "red"), lty = 1, cex=0.7)
+
+
+
+# Estimate survival curves for 50yo White male on ppi,GERD
+survfit3 <- survfit(final_CoxModel, 
+                    newdata = data.frame(ppi = "1", 
+                                         age = 50,
+                                         gender = "Male",
+                                         recent_gerd = "1",
+                                         recent_pepticulcer ="0",
+                                         prior_gastric_cancer ="0",
+                                         eth5 = "White",
+                                         imd_person = "Least Deprived (1)"))
+
+# Estimate survival curves for 50yo White male on H2RA, GERD
+survfit4 <- survfit(final_CoxModel, 
+                    newdata = data.frame(ppi = "0", 
+                                         age = 50,
+                                         gender = "Male",
+                                         recent_gerd = "1",
+                                         recent_pepticulcer ="0",
+                                         prior_gastric_cancer ="0",
+                                         eth5 = "White",
+                                         imd_person = "Least Deprived (1)"))
+
+# Plot survival curves
+plot(survfit3, col = "blue", lty = 1, xlim = c(0, 20), ylim = c(0, 1), xlab = "Time(years)", ylab = "Survival Probability", main = "50yo White Male,GERD,Least Deprived ")
+lines(survfit4, col = "red", lty = 1)
+legend("bottomleft", legend = c("PPI", "H2RA"), col = c("blue", "red"), lty = 1, cex=0.7)
+
+# Estimate survival curves for 50yo White female on ppi, no comorbidities
+survfit5 <- survfit(final_CoxModel, 
+                    newdata = data.frame(ppi = "1", 
+                                         age = 50,
+                                         gender = "Female",
+                                         recent_gerd = "0",
+                                         recent_pepticulcer ="0",
+                                         prior_gastric_cancer ="0",
+                                         eth5 = "White",
+                                         imd_person = "Most Deprived (5)"))
+
+# Estimate survival curves for 50yo White female on H2RA, no comorbidities
+survfit6 <- survfit(final_CoxModel, 
+                    newdata = data.frame(ppi = "0", 
+                                         age = 50,
+                                         gender = "Female",
+                                         recent_gerd = "0",
+                                         recent_pepticulcer ="0",
+                                         prior_gastric_cancer ="0",
+                                         eth5 = "White",
+                                         imd_person = "Most Deprived (5)"))
+
+# Plot survival curves
+plot(survfit5, col = "blue", lty = 1, xlim = c(0, 20), ylim = c(0, 1), xlab = "Time(years)", ylab = "Survival Probability", main = "50yo White Female,Most Deprived ")
+lines(survfit6, col = "red", lty = 1)
+legend("bottomleft", legend = c("PPI", "H2RA"), col = c("blue", "red"), lty = 1, cex = 0.7)
+
+# Estimate survival curves for 50yo White female on ppi, GERD
+survfit7 <- survfit(final_CoxModel, 
+                    newdata = data.frame(ppi = "1", 
+                                         age = 50,
+                                         gender = "Female",
+                                         recent_gerd = "1",
+                                         recent_pepticulcer ="0",
+                                         prior_gastric_cancer ="0",
+                                         eth5 = "White",
+                                         imd_person = "Least Deprived (1)"))
+
+# Estimate survival curves for 50yo White female on H2RA, GERD
+survfit8 <- survfit(final_CoxModel, 
+                    newdata = data.frame(ppi = "0", 
+                                         age = 50,
+                                         gender = "Female",
+                                         recent_gerd = "1",
+                                         recent_pepticulcer ="0",
+                                         prior_gastric_cancer ="0",
+                                         eth5 = "White",
+                                         imd_person = "Least Deprived (1)"))
+
+# Plot survival curves
+plot(survfit7, col = "blue", lty = 1, xlim = c(0, 20), ylim = c(0, 1), xlab = "Time(years)", ylab = "Survival Probability", main = "50yo White Female,GERD,Least Deprived ")
+lines(survfit8, col = "red", lty = 1)
+legend("bottomleft", legend = c("PPI", "H2RA"), col = c("blue", "red"), lty = 1, cex = 0.7)
+
+
+```
+
+#### Sensitivity analysis
+
+```{r}
+# confounder selection With p value
+# Recent peptic ulcer and GERD excluded
+pvalmodel <- step(object = cox_multivariable, direction = "both", trace = 0, test = "Chisq")
+summary(pvalmodel)
+
+# confounder selection with AIC
+AICmodel <- step(cox_multivariable)
+summary(AICmodel)
+
+#BMI included in final model
+cox_sens1 <- coxph(Surv(survtime, died) ~ 
+                            factor(ppi) + 
+                            factor(recent_gerd) +
+                            factor(recent_pepticulcer) + 
+                            factor(prior_gastric_cancer) + 
+                            factor(gender) + 
+                            factor(eth5) + 
+                            bmi+
+                            factor(imd_person) +
+                            age +
+                            I(age^3),
+                          data = analysis_dataset)
+summary(cox_sens1)
+
+# Stratification methods for selected confounders, gender and deprivation status
+cox_sens2 <- coxph(Surv(survtime, died) ~ 
+                          factor(ppi) + 
+                          factor(recent_gerd) +
+                          factor(recent_pepticulcer) + 
+                          factor(prior_gastric_cancer) + 
+                          strata(factor(gender)) + 
+                          factor(eth5) + 
+                          strata(factor(imd_person)) +
+                          age +
+                          I(age^3),
+                        data = analysis_dataset)
+summary(cox_sens2)
+
+
+
+```
